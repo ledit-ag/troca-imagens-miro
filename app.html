@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Troca de imagens</title>
+<script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
+<style>
+  :root { --ink:#1f2328; --muted:#656d76; --line:#d8dee4; --bg:#f6f8fa; --ok:#1a7f37; --err:#cf222e; --accent:#4262ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); }
+  h1 { font-size:16px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:12.5px; margin:0 0 16px; }
+  .step { border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
+  .step h2 { font-size:13px; margin:0 0 6px; }
+  .step p { margin:0 0 10px; color:var(--muted); font-size:12.5px; }
+  button { font:inherit; font-size:13px; border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:8px; padding:7px 12px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { background:var(--err); border-color:var(--err); color:#fff; }
+  button:disabled { opacity:.45; cursor:default; }
+  .status { font-size:12.5px; margin-top:8px; white-space:pre-line; }
+  .status.ok { color:var(--ok); } .status.err { color:var(--err); }
+  .modo { font-size:12px; margin-top:8px; padding:6px 8px; border-radius:6px; background:var(--bg); color:var(--ink); }
+  .modo:empty { display:none; }
+  ol.pares { list-style:none; margin:10px 0 0; padding:0; max-height:340px; overflow:auto; border-top:1px solid var(--line); }
+  ol.pares:empty { border-top:0; }
+  ol.pares li { display:grid; grid-template-columns:22px 40px 1fr 18px; gap:8px; align-items:center; padding:6px 2px; border-bottom:1px solid var(--line); font-size:12px; cursor:pointer; }
+  ol.pares li:hover { background:var(--bg); }
+  ol.pares .n { color:var(--muted); text-align:right; }
+  ol.pares img { width:40px; height:28px; object-fit:cover; border-radius:3px; background:var(--bg); }
+  ol.pares .pos { color:var(--muted); display:block; }
+  ol.pares .arq { word-break:break-all; }
+  ol.pares .st.ok { color:var(--ok); } ol.pares .st.err { color:var(--err); }
+  input[type=file] { display:none; }
+</style>
+</head>
+<body>
+  <h1>Troca de imagens em lote</h1>
+  <p class="sub">Troca as imagens sem apagar, então os comentários continuam.</p>
+
+  <div class="step">
+    <h2>1. O que trocar no board</h2>
+    <p>Selecione no board o frame (ou as imagens) e clique abaixo.</p>
+    <button id="btnSel">Usar a seleção do board</button>
+    <div id="stSel" class="status"></div>
+  </div>
+
+  <div class="step">
+    <h2>2. Imagens novas</h2>
+    <p>Escolha os arquivos novos (.jpg ou .png).</p>
+    <button id="btnArq">Escolher arquivos</button>
+    <input id="inArq" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" multiple>
+    <div id="stArq" class="status"></div>
+  </div>
+
+  <div class="step">
+    <h2>3. Conferir e trocar</h2>
+    <p>Clique numa linha da lista para ver a imagem no board.</p>
+    <div id="modo" class="modo"></div>
+    <button id="btnTrocar" class="primary" disabled style="margin-top:10px">Trocar imagens</button>
+    <div id="stTroca" class="status"></div>
+    <ol id="lista" class="pares"></ol>
+  </div>
+
+
+<script>
+// Como o app casa imagem e arquivo:
+// 1. Pelo nome: se houver um texto logo abaixo da imagem (ou logo acima) igual ao
+//    nome de um arquivo escolhido, os dois se casam. A posição no board não importa.
+// 2. Pela ordem: se nenhuma imagem tiver nome, usa a ordem de leitura do board
+//    (linhas de cima para baixo, cada uma da esquerda para a direita) e a ordem
+//    dos nomes dos arquivos (números lidos como números).
+const EXT = /\.(jpe?g|png)$/i;
+const ORDEM_NOMES = new Intl.Collator('pt-BR', { numeric: true, sensitivity: 'base' });
+
+let alvos = [];            // imagens selecionadas, em ordem de leitura
+let arquivos = [];         // arquivos escolhidos, em ordem de nome
+let pares = [];            // { it, a } que serão trocados
+let confirmando = false, trocando = false;
+// Dados guardados fora dos objetos do Miro (o sync recusa campos extras):
+const meta = new Map();    // id -> { x, y, linha, col }
+const rotulo = new Map();  // id da imagem -> textos junto dela, do mais perto ao mais longe
+
+const $ = id => document.getElementById(id);
+function status(el, txt, tipo) { el.textContent = txt; el.className = 'status' + (tipo ? ' ' + tipo : ''); }
+function textoPuro(html) { return new DOMParser().parseFromString(html || '', 'text/html').body.textContent.replace(/\s+/g, ' ').trim(); }
+function chave(nome) { return nome.normalize('NFC').replace(EXT, '').replace(/\s+/g, ' ').trim().toLowerCase(); }
+
+// posição de um item no board (itens dentro de frame vêm relativos ao frame)
+async function posicaoAbs(item, cacheFrames) {
+  let x = item.x, y = item.y;
+  if (item.parentId && item.relativeTo !== 'canvas_center') {
+    let pai = cacheFrames.get(item.parentId);
+    if (!pai) { pai = await miro.board.getById(item.parentId); cacheFrames.set(item.parentId, pai); }
+    if (pai && typeof pai.width === 'number') {
+      x = pai.x - pai.width / 2 + item.x;
+      y = pai.y - pai.height / 2 + item.y;
+    }
+  }
+  return { x, y };
+}
+
+// ---------- 1. imagens do board ----------
+async function lerSelecao() {
+  status($('stSel'), 'Lendo a seleção...');
+  const sel = await miro.board.getSelection();
+  const porId = new Map();
+  const frames = new Map();
+  for (const item of sel) {
+    if (item.type === 'frame') {
+      frames.set(item.id, item);
+      const filhos = await item.getChildren();
+      filhos.filter(f => f.type === 'image').forEach(f => porId.set(f.id, f));
+    } else if (item.type === 'image') {
+      porId.set(item.id, item);
+    }
+  }
+  const imgs = [...porId.values()];
+  meta.clear(); rotulo.clear();
+  if (!imgs.length) {
+    alvos = [];
+    status($('stSel'), 'Nenhuma imagem na seleção. Selecione o frame ou as imagens e tente de novo.', 'err');
+    atualizar();
+    return;
+  }
+  for (const im of imgs) meta.set(im.id, await posicaoAbs(im, frames));
+  alvos = ordemDeLeitura(imgs);
+
+  // procura o nome escrito logo abaixo (ou logo acima) de cada imagem
+  status($('stSel'), 'Procurando os nomes junto das imagens...');
+  const textos = await miro.board.get({ type: 'text' });
+  const ts = [];
+  for (const t of textos) {
+    const nome = textoPuro(t.content);
+    if (!nome || nome.length > 200) continue;
+    const p = await posicaoAbs(t, frames);
+    ts.push({ x: p.x, y: p.y, h: t.height || 0, nome });
+  }
+  for (const im of imgs) {
+    const m = meta.get(im.id);
+    const esq = m.x - im.width / 2, dir = m.x + im.width / 2;
+    const topo = m.y - im.height / 2, base = m.y + im.height / 2;
+    const limite = Math.max(40, im.height * 0.35);
+    const perto = [];
+    for (const t of ts) {
+      if (t.x < esq || t.x > dir) continue;
+      const tTopo = t.y - t.h / 2, tBase = t.y + t.h / 2;
+      let d = null;
+      if (tTopo >= base - 5 && tTopo - base <= limite) d = tTopo - base;               // embaixo
+      else if (tBase <= topo + 5 && topo - tBase <= limite) d = limite + (topo - tBase); // em cima (só se não houver embaixo)
+      if (d !== null) perto.push({ d, nome: t.nome });
+    }
+    if (perto.length) rotulo.set(im.id, perto.sort((a, b) => a.d - b.d).map(c => c.nome));
+  }
+
+  const nFrames = frames.size;
+  const ultima = meta.get(alvos[alvos.length - 1].id).linha;
+  status($('stSel'), `${alvos.length} imagens encontradas` + (nFrames ? ` (em ${nFrames} frame${nFrames > 1 ? 's' : ''})` : '') +
+    `, em ${ultima} linha(s). ${rotulo.size ? rotulo.size + ' com nome junto.' : 'Nenhuma com nome junto.'}`, 'ok');
+  atualizar();
+}
+
+function ordemDeLeitura(imgs) {
+  const alturas = imgs.map(i => i.height || 0).sort((a, b) => a - b);
+  const tol = (alturas[Math.floor(alturas.length / 2)] || 100) / 2;
+  const Y = i => meta.get(i.id).y, X = i => meta.get(i.id).x;
+  const linhas = [];
+  for (const it of [...imgs].sort((a, b) => Y(a) - Y(b))) {
+    const ult = linhas[linhas.length - 1];
+    if (ult) {
+      const media = ult.reduce((s, i) => s + Y(i), 0) / ult.length;
+      if (Math.abs(Y(it) - media) <= tol) { ult.push(it); continue; }
+    }
+    linhas.push([it]);
+  }
+  const ordem = [];
+  linhas.forEach((linha, li) => {
+    linha.sort((a, b) => X(a) - X(b)).forEach((it, ci) => { const m = meta.get(it.id); m.linha = li + 1; m.col = ci + 1; ordem.push(it); });
+  });
+  return ordem;
+}
+
+// ---------- 2. arquivos ----------
+function lerArquivos(lista) {
+  const validos = [];
+  for (const f of lista) {
+    if (!EXT.test(f.name)) continue;
+    validos.push({ nome: f.name, file: f, thumb: URL.createObjectURL(f) });
+  }
+  validos.sort((a, b) => ORDEM_NOMES.compare(chave(a.nome), chave(b.nome)));
+  arquivos = validos;
+  if (!validos.length) {
+    status($('stArq'), 'Nenhum arquivo .jpg ou .png escolhido.', 'err');
+  } else {
+    const mb = validos.reduce((s, v) => s + v.file.size, 0) / 1048576;
+    status($('stArq'), validos.length === 1
+      ? `1 arquivo (${mb.toFixed(1)} MB).`
+      : `${validos.length} arquivos, de ${validos[0].nome} até ${validos[validos.length - 1].nome} (${mb.toFixed(1)} MB no total).`, 'ok');
+  }
+  atualizar();
+}
+
+// ---------- 3. conferência ----------
+function montarPares() {
+  // devolve { modo, pares, aviso } ou { erro }
+  const porNome = new Map(arquivos.map(a => [chave(a.nome), a]));
+  // usa o texto mais próximo da imagem que for igual ao nome de um arquivo (ignora "Aprovado" etc.)
+  const nomeCasado = it => (rotulo.get(it.id) || []).find(n => porNome.has(chave(n)));
+  const casadas = alvos.filter(it => nomeCasado(it));
+
+  if (casadas.length) {
+    const usados = new Map();
+    const repetidos = [];
+    for (const it of casadas) {
+      const k = chave(nomeCasado(it));
+      if (usados.has(k)) repetidos.push(nomeCasado(it)); else usados.set(k, it);
+    }
+    if (repetidos.length) return { erro: 'Há mais de uma imagem com o mesmo nome no board:\n' + [...new Set(repetidos)].join('\n') + '\nNada será trocado.' };
+    const semImagem = arquivos.filter(a => !usados.has(chave(a.nome)));
+    if (semImagem.length) return { erro: 'Estes arquivos não têm imagem com o mesmo nome na seleção:\n' + semImagem.map(a => a.nome).join('\n') + '\nConfira os nomes ou a seleção. Nada será trocado.' };
+    const ps = alvos.filter(it => { const n = nomeCasado(it); return n && usados.get(chave(n)) === it; })
+      .map(it => ({ it, a: porNome.get(chave(nomeCasado(it))) }));
+    const ficam = alvos.length - ps.length;
+    return { modo: 'nome', pares: ps,
+      aviso: `Casando pelo nome escrito junto de cada imagem. ${ps.length} imagem(ns) serão trocadas` + (ficam ? `; ${ficam} da seleção ficam como estão (sem arquivo novo).` : '.') };
+  }
+
+  if (alvos.length !== arquivos.length) {
+    const dica = rotulo.size ? ' Os nomes junto das imagens não batem com nenhum arquivo escolhido.' : '';
+    return { erro: `Sem nomes para casar, a troca é pela ordem, e as quantidades não batem: ${alvos.length} imagens na seleção e ${arquivos.length} arquivos.${dica} Nada será trocado.` };
+  }
+  return { modo: 'ordem', pares: alvos.map((it, i) => ({ it, a: arquivos[i] })),
+    aviso: 'Nenhuma imagem com o nome do arquivo junto: casando pela ordem (linhas de cima para baixo, da esquerda para a direita) e pela ordem dos nomes dos arquivos.' };
+}
+
+function atualizar() {
+  confirmando = false;
+  pares = [];
+  const lista = $('lista');
+  lista.innerHTML = '';
+  $('modo').textContent = '';
+  const btn = $('btnTrocar');
+  btn.className = 'primary';
+  btn.textContent = 'Trocar imagens';
+  btn.disabled = true;
+  status($('stTroca'), '');
+  if (!alvos.length || !arquivos.length) return;
+
+  const r = montarPares();
+  if (r.erro) { status($('stTroca'), r.erro, 'err'); return; }
+  pares = r.pares;
+  $('modo').textContent = r.aviso;
+  pares.forEach(({ it, a }, i) => {
+    const m = meta.get(it.id);
+    const li = document.createElement('li');
+    li.innerHTML = '<span class="n"></span><img alt=""><span><span class="pos"></span><span class="arq"></span></span><span class="st"></span>';
+    li.querySelector('.n').textContent = i + 1;
+    li.querySelector('img').src = a.thumb;
+    li.querySelector('.pos').textContent = r.modo === 'nome'
+      ? `pelo nome (linha ${m.linha}, posição ${m.col})`
+      : `linha ${m.linha}, posição ${m.col}`;
+    li.querySelector('.arq').textContent = a.nome;
+    li.onclick = () => miro.board.viewport.zoomTo(it).catch(() => {});
+    lista.appendChild(li);
+  });
+  btn.disabled = false;
+  btn.textContent = `Trocar ${pares.length} imagem${pares.length > 1 ? 's' : ''}`;
+}
+
+function lerComoDataUrl(file) {
+  return new Promise((ok, falha) => {
+    const r = new FileReader();
+    r.onload = () => ok(r.result);
+    r.onerror = () => falha(new Error('não consegui ler o arquivo'));
+    r.readAsDataURL(file);
+  });
+}
+
+async function trocar() {
+  if (trocando || !pares.length) return;
+  const btn = $('btnTrocar');
+  if (!confirmando) {
+    confirmando = true;
+    btn.className = 'danger';
+    btn.textContent = `Confirmar: trocar ${pares.length} imagem${pares.length > 1 ? 's' : ''}`;
+    status($('stTroca'), 'Confira a lista e clique de novo para confirmar.');
+    return;
+  }
+  trocando = true;
+  btn.disabled = true; $('btnSel').disabled = true; $('btnArq').disabled = true;
+  const linhas = [...$('lista').children];
+  let feitas = 0;
+  for (let i = 0; i < pares.length; i++) {
+    const { it, a } = pares[i];
+    const st = linhas[i].querySelector('.st');
+    status($('stTroca'), `Trocando ${i + 1} de ${pares.length}: ${a.nome}`);
+    linhas[i].scrollIntoView({ block: 'nearest' });
+    try {
+      const largura = it.width;
+      it.url = await lerComoDataUrl(a.file);
+      await it.sync();
+      const atual = await miro.board.getById(it.id);
+      if (atual && typeof largura === 'number' && Math.abs(atual.width - largura) > 1) {
+        atual.width = largura;
+        await atual.sync();
+      }
+      st.textContent = '✓'; st.className = 'st ok';
+      feitas++;
+    } catch (e) {
+      st.textContent = '✗'; st.className = 'st err';
+      status($('stTroca'), `Parei em ${a.nome}: ${e && e.message ? e.message : e}. As ${feitas} anteriores já foram trocadas.`, 'err');
+      fim();
+      return;
+    }
+  }
+  const sumiram = [];
+  for (const { it } of pares) {
+    try { const x = await miro.board.getById(it.id); if (!x) sumiram.push(it.id); } catch (e) { sumiram.push(it.id); }
+  }
+  status($('stTroca'), sumiram.length
+    ? `Atenção: ${sumiram.length} imagem(ns) não aparecem mais no board.`
+    : `Pronto: ${feitas} imagem${feitas > 1 ? 's' : ''} trocada${feitas > 1 ? 's' : ''}, nenhuma sumiu.`, sumiram.length ? 'err' : 'ok');
+  fim();
+}
+
+function fim() {
+  trocando = false; confirmando = false;
+  $('btnSel').disabled = false; $('btnArq').disabled = false;
+  $('btnTrocar').disabled = true;
+  $('btnTrocar').className = 'primary';
+  $('btnTrocar').textContent = 'Trocar imagens';
+}
+
+$('btnSel').onclick = () => lerSelecao().catch(e => status($('stSel'), 'Erro ao ler a seleção: ' + (e.message || e), 'err'));
+$('btnArq').onclick = () => $('inArq').click();
+$('inArq').onchange = e => { lerArquivos([...e.target.files]); e.target.value = ''; };
+$('btnTrocar').onclick = () => trocar();
+</script>
+</body>
+</html>
